@@ -27,15 +27,19 @@ pub fn view(file: &FileSummary, selected: Option<usize>) -> Element<'_, Message>
             .padding([2, 4]),
             body_cell(format!("Group {i}"), 110.0, zebra),
             body_cell(format!("{}", rg.num_rows()), 110.0, zebra),
-            body_cell(human_bytes(rg.total_byte_size().max(0) as u64), 140.0, zebra),
+            body_cell(
+                human_bytes(rg.total_byte_size().max(0) as u64),
+                140.0,
+                zebra
+            ),
             body_cell(human_bytes(compressed.max(0) as u64), 140.0, zebra),
             body_cell(format!("{}", rg.num_columns()), 90.0, zebra),
         ]
         .spacing(0)
         .align_y(iced::Alignment::Center);
 
-        let styled_summary = container(summary)
-            .style(move |theme: &Theme| body_row_style(theme, zebra));
+        let styled_summary =
+            container(summary).style(move |theme: &Theme| body_row_style(theme, zebra));
         col = col.push(styled_summary);
 
         if selected == Some(i) {
@@ -66,12 +70,9 @@ fn column_chunk_table(file: &FileSummary, rg_idx: usize) -> Element<'_, Message>
         Some(_) => "(empty)".into(),
         None => "(not specified)".into(),
     };
-    let sort_row = row![
-        text("Sort order:").size(13),
-        text(sort_label).size(13),
-    ]
-    .spacing(8)
-    .padding([0, 0]);
+    let sort_row = row![text("Sort order:").size(13), text(sort_label).size(13),]
+        .spacing(8)
+        .padding([0, 0]);
     let mut col = column![sort_row, chunk_header()].spacing(0);
 
     for (idx, cc) in rg.columns().iter().enumerate() {
@@ -87,8 +88,16 @@ fn column_chunk_table(file: &FileSummary, rg_idx: usize) -> Element<'_, Message>
             body_cell(format!("{:?}", cc.compression()), 120.0, zebra),
             body_cell(encodings.join(", "), 220.0, zebra),
             body_cell(format!("{}", cc.num_values()), 90.0, zebra),
-            body_cell(human_bytes(cc.uncompressed_size().max(0) as u64), 120.0, zebra),
-            body_cell(human_bytes(cc.compressed_size().max(0) as u64), 120.0, zebra),
+            body_cell(
+                human_bytes(cc.uncompressed_size().max(0) as u64),
+                120.0,
+                zebra
+            ),
+            body_cell(
+                human_bytes(cc.compressed_size().max(0) as u64),
+                120.0,
+                zebra
+            ),
             body_cell(stats_str, 360.0, zebra),
         ]
         .spacing(0);
@@ -114,15 +123,11 @@ fn chunk_header() -> Element<'static, Message> {
 }
 
 fn header_cell<'a>(label: &str, width: f32) -> Element<'a, Message> {
-    container(
-        text(label.to_string())
-            .size(13)
-            .wrapping(Wrapping::None),
-    )
-    .width(Length::Fixed(width))
-    .padding([6, 10])
-    .clip(true)
-    .into()
+    container(text(label.to_string()).size(13).wrapping(Wrapping::None))
+        .width(Length::Fixed(width))
+        .padding([6, 10])
+        .clip(true)
+        .into()
 }
 
 fn body_cell<'a>(value: String, width: f32, _zebra: bool) -> Element<'a, Message> {
