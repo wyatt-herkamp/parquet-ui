@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Parquet UI
+GenericName=Parquet File Viewer
+Comment=Inspect Apache Parquet files — metadata, schema, row groups, and data
+Exec=parquet-ui %f
+Icon=application-x-parquet
+Terminal=false
+Categories=Utility;Database;
+MimeType=application/vnd.apache.parquet;application/x-parquet;
+Keywords=parquet;arrow;data;analytics;
+StartupNotify=true
+StartupWMClass=parquet-ui
