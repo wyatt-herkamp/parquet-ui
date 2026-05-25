@@ -1,5 +1,6 @@
 use iced::Element;
 use iced::widget::{column, container, row, text};
+use parquet::file::metadata::SortingColumn;
 
 use crate::app::Message;
 use crate::format::human_bytes;
@@ -42,6 +43,9 @@ pub fn view(file: &FileSummary) -> Element<'_, Message> {
     ]
     .spacing(6);
 
+    col = col.push(section("Sort Order"));
+    col = col.push(kv("Row groups", sort_order_summary(file)));
+
     if let Some(kv_pairs) = meta.key_value_metadata() {
         if !kv_pairs.is_empty() {
             col = col.push(section("Key/Value Metadata"));
@@ -53,6 +57,53 @@ pub fn view(file: &FileSummary) -> Element<'_, Message> {
     }
 
     col.into()
+}
+
+pub fn format_sorting_columns(file: &FileSummary, cols: &[SortingColumn]) -> String {
+    if cols.is_empty() {
+        return "(none specified)".into();
+    }
+    cols.iter()
+        .map(|sc| {
+            let name = file
+                .schema
+                .fields()
+                .get(sc.column_idx as usize)
+                .map(|f| f.name().as_str())
+                .unwrap_or("?");
+            let dir = if sc.descending { "DESC" } else { "ASC" };
+            let nulls = if sc.nulls_first { "NULLS FIRST" } else { "NULLS LAST" };
+            format!("{name} {dir} {nulls}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn sort_order_summary(file: &FileSummary) -> String {
+    let groups = file.metadata.row_groups();
+    if groups.is_empty() {
+        return "(no row groups)".into();
+    }
+
+    let key = |rg: &parquet::file::metadata::RowGroupMetaData| -> Option<Vec<(i32, bool, bool)>> {
+        rg.sorting_columns().map(|v| {
+            v.iter()
+                .map(|sc| (sc.column_idx, sc.descending, sc.nulls_first))
+                .collect()
+        })
+    };
+
+    let first_key = key(&groups[0]);
+    let uniform = groups.iter().all(|rg| key(rg) == first_key);
+
+    match (first_key.is_some(), uniform) {
+        (false, true) => "(not specified)".into(),
+        (true, true) => {
+            let cols = groups[0].sorting_columns().unwrap();
+            format_sorting_columns(file, cols)
+        }
+        (_, false) => "(varies by row group — see Row Groups tab)".into(),
+    }
 }
 
 fn section(title: &str) -> Element<'_, Message> {

@@ -7,6 +7,7 @@ use parquet::file::statistics::Statistics;
 use crate::app::Message;
 use crate::format::human_bytes;
 use crate::parquet_io::FileSummary;
+use crate::views::overview::format_sorting_columns;
 
 pub fn view(file: &FileSummary, selected: Option<usize>) -> Element<'_, Message> {
     let mut col = column![summary_header()].spacing(0);
@@ -60,7 +61,18 @@ fn summary_header() -> Element<'static, Message> {
 
 fn column_chunk_table(file: &FileSummary, rg_idx: usize) -> Element<'_, Message> {
     let rg = file.metadata.row_group(rg_idx);
-    let mut col = column![chunk_header()].spacing(0);
+    let sort_label = match rg.sorting_columns() {
+        Some(cols) if !cols.is_empty() => format_sorting_columns(file, cols),
+        Some(_) => "(empty)".into(),
+        None => "(not specified)".into(),
+    };
+    let sort_row = row![
+        text("Sort order:").size(13),
+        text(sort_label).size(13),
+    ]
+    .spacing(8)
+    .padding([0, 0]);
+    let mut col = column![sort_row, chunk_header()].spacing(0);
 
     for (idx, cc) in rg.columns().iter().enumerate() {
         let encodings: Vec<String> = cc.encodings().map(|e| format!("{e:?}")).collect();

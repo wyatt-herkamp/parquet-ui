@@ -1,10 +1,14 @@
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use arrow::record_batch::RecordBatch;
 use iced::widget::{Space, button, column, container, row, scrollable, text};
 use iced::{Element, Length, Task};
 
-use crate::parquet_io::{FileSummary, load_metadata, load_page};
+use crate::parquet_io::{
+    CANCELLED, FileStats, FileSummary, compute_distinct, load_metadata, load_page, quick_stats,
+};
 use crate::views;
 
 const DEFAULT_PAGE_SIZE: usize = 100;
@@ -23,6 +27,11 @@ pub struct App {
     pub page_size_input: String,
     pub current_batch: Option<RecordBatch>,
     pub page_loading: bool,
+
+    pub stats: Option<FileStats>,
+    pub stats_loading: bool,
+    pub stats_error: Option<String>,
+    pub stats_cancel: Arc<AtomicBool>,
 
     pub copy_notice: Option<String>,
 }
@@ -61,6 +70,7 @@ pub enum Message {
     PageSizeInput(String),
     PageSizeCommit,
     PageLoaded(Result<RecordBatch, String>),
+    DistinctLoaded(Arc<AtomicBool>, Result<Vec<usize>, String>),
     CopyCell(String),
     ClearCopyNotice,
 }
@@ -114,15 +124,28 @@ impl App {
             }
             Message::FileLoaded(Ok(summary)) => {
                 self.loading = false;
+                self.stats_cancel.store(true, Ordering::Relaxed);
+                let cancel = Arc::new(AtomicBool::new(false));
+                self.stats_cancel = cancel.clone();
+                self.stats = Some(quick_stats(&summary));
+                self.stats_error = None;
+                self.stats_loading = true;
+                let path = summary.path.clone();
                 self.file = Some(summary);
                 self.selected_row_group = None;
                 self.page = 0;
                 self.current_batch = None;
-                if self.tab == Tab::Data {
+                let token = cancel.clone();
+                let distinct_task = Task::perform(
+                    compute_distinct(path, cancel),
+                    move |r| Message::DistinctLoaded(token.clone(), r),
+                );
+                let page_task = if self.tab == Tab::Data {
                     self.dispatch_page_load()
                 } else {
                     Task::none()
-                }
+                };
+                Task::batch([distinct_task, page_task])
             }
             Message::FileLoaded(Err(e)) => {
                 self.loading = false;
@@ -190,6 +213,27 @@ impl App {
             Message::PageLoaded(Err(e)) => {
                 self.page_loading = false;
                 self.error = Some(e);
+                Task::none()
+            }
+            Message::DistinctLoaded(token, result) => {
+                if !Arc::ptr_eq(&token, &self.stats_cancel) {
+                    return Task::none();
+                }
+                self.stats_loading = false;
+                match result {
+                    Ok(distincts) => {
+                        if let Some(stats) = self.stats.as_mut() {
+                            for (i, d) in distincts.into_iter().enumerate() {
+                                if let Some(col) = stats.columns.get_mut(i) {
+                                    col.distinct_count = Some(d);
+                                }
+                            }
+                        }
+                        self.stats_error = None;
+                    }
+                    Err(e) if e == CANCELLED => {}
+                    Err(e) => self.stats_error = Some(e),
+                }
                 Task::none()
             }
             Message::CopyCell(value) => {
@@ -332,6 +376,9 @@ impl App {
                 &self.page_size_input,
                 self.page_loading,
                 self.total_pages(),
+                self.stats.as_ref(),
+                self.stats_loading,
+                self.stats_error.as_deref(),
             ),
         };
 

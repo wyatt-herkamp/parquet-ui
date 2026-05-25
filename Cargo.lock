@@ -2744,6 +2744,7 @@ dependencies = [
 name = "parquet-ui"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "arrow",
  "iced",
  "parquet",
