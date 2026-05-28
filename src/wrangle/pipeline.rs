@@ -30,6 +30,10 @@ pub enum Step {
         column: String,
         value: String,
     },
+    NullIf {
+        column: String,
+        value: String,
+    },
     DropNa {
         columns: Vec<String>,
     },
@@ -213,6 +217,7 @@ impl Step {
                 target_type,
             } => format!("Cast {column} → {target_type}"),
             Step::FillNa { column, value } => format!("Fill nulls in {column} with {value}"),
+            Step::NullIf { column, value } => format!("Nullify {column} when equal to {value}"),
             Step::DropNa { columns } => {
                 if columns.is_empty() {
                     "Drop rows with any null".into()
@@ -303,6 +308,10 @@ impl Step {
             Step::FillNa { column, value } => {
                 let id = ident(column);
                 format!("SELECT * REPLACE (COALESCE({id}, {value}) AS {id}) FROM ({prev})")
+            }
+            Step::NullIf { column, value } => {
+                let id = ident(column);
+                format!("SELECT * REPLACE (NULLIF({id}, {value}) AS {id}) FROM ({prev})")
             }
             Step::DropNa { columns } => {
                 if columns.is_empty() {

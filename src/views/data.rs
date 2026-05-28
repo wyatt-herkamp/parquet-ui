@@ -2,21 +2,21 @@ use arrow::record_batch::RecordBatch;
 use iced::widget::container::Style as ContainerStyle;
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    Space, button, canvas, column, container, mouse_area, row, scrollable, text, text_input,
-    tooltip,
+    Space, button, canvas, column, container, mouse_area, opaque, row, scrollable, stack, text,
+    text_input, tooltip,
 };
 use iced::{Background, Border, Color, Element, Length, Point, Rectangle, Renderer, Size, Theme};
 
-use crate::app::{Editor, EditorField, EditorKind, Message, WrangleState};
-use crate::format::{default_options, row_strings};
+use crate::app::{CellDetail, Editor, EditorField, EditorKind, Message, WrangleState};
+use crate::format::{NestedNode, default_options, is_nested, row_strings};
 use crate::wrangle::insights::{ColumnInsight, Histogram};
 use crate::wrangle::pipeline::{AggFn, Pipeline};
 use crate::wrangle::summary::ColumnSummary;
 
 const CELL_WIDTH: f32 = 180.0;
-const ROW_NUMBER_WIDTH: f32 = 70.0;
-const ROW_HEIGHT: f32 = 26.0;
-const HEADER_HEIGHT: f32 = 30.0;
+const ROW_NUMBER_WIDTH: f32 = 60.0;
+const ROW_HEIGHT: f32 = 24.0;
+const HEADER_HEIGHT: f32 = 48.0;
 const INSIGHTS_HEIGHT: f32 = 100.0;
 const HISTO_HEIGHT: f32 = 36.0;
 const OVERFLOW_CHAR_THRESHOLD: usize = 20;
@@ -121,10 +121,175 @@ pub fn view<'a>(state: &'a WrangleState, total_pages: usize) -> Element<'a, Mess
     ]
     .spacing(0);
 
-    column![top_bar, split, sql_panel]
+    let main: Element<'a, Message> = column![top_bar, split, sql_panel]
         .spacing(10)
         .height(Length::Fill)
-        .into()
+        .into();
+
+    if let Some(detail) = state.cell_detail.as_ref() {
+        stack![main, cell_detail_overlay(detail)].into()
+    } else {
+        main
+    }
+}
+
+fn cell_detail_overlay<'a>(detail: &'a CellDetail) -> Element<'a, Message> {
+    let header = row![
+        text(format!("{} · row {}", detail.column_name, detail.row + 1))
+            .size(14)
+            .wrapping(Wrapping::None),
+        Space::new().width(Length::Fill),
+        button(text("Copy JSON").size(11))
+            .style(button::secondary)
+            .on_press(Message::CopyCell(detail.node.to_json_string())),
+        button(text("Close").size(11))
+            .style(button::secondary)
+            .on_press(Message::CloseCellDetail),
+    ]
+    .spacing(6)
+    .align_y(iced::Alignment::Center);
+
+    let type_line = text(detail.type_label.clone())
+        .size(11)
+        .style(|theme: &Theme| text::Style {
+            color: Some(theme.extended_palette().background.strong.color),
+        });
+
+    let tree_widgets = render_node(&detail.node, 0);
+    let tree: Element<'a, Message> = scrollable(
+        container(column(tree_widgets).spacing(2))
+            .padding(8)
+            .width(Length::Fill),
+    )
+    .height(Length::Fill)
+    .into();
+
+    let panel = container(column![header, type_line, tree].spacing(8))
+        .padding(14)
+        .width(Length::Fixed(640.0))
+        .height(Length::Fixed(480.0))
+        .style(detail_panel_style);
+
+    // Dim backdrop that intercepts clicks (closes on outside-click).
+    let backdrop = mouse_area(
+        container(Space::new())
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(crate::theme::backdrop),
+    )
+    .on_press(Message::CloseCellDetail);
+
+    let centered = container(opaque(panel))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill);
+
+    stack![backdrop, centered].into()
+}
+
+fn render_node<'a>(node: &NestedNode, indent: usize) -> Vec<Element<'a, Message>> {
+    let mut out = Vec::new();
+    let pad = "  ".repeat(indent);
+    match node {
+        NestedNode::Null => {
+            out.push(tree_text(format!("{pad}∅"), false));
+        }
+        NestedNode::Leaf(s) => {
+            out.push(tree_text(format!("{pad}{s}"), false));
+        }
+        NestedNode::List(items) => {
+            if items.is_empty() {
+                out.push(tree_text(format!("{pad}[ ] (empty)"), true));
+            } else {
+                out.push(tree_text(format!("{pad}[ {} items ]", items.len()), true));
+                for (i, child) in items.iter().enumerate() {
+                    match child {
+                        NestedNode::Leaf(s) => {
+                            out.push(tree_text(format!("{pad}  [{i}] {s}"), false));
+                        }
+                        NestedNode::Null => {
+                            out.push(tree_text(format!("{pad}  [{i}] ∅"), false));
+                        }
+                        _ => {
+                            out.push(tree_text(format!("{pad}  [{i}]"), true));
+                            out.extend(render_node(child, indent + 2));
+                        }
+                    }
+                }
+            }
+        }
+        NestedNode::Struct(fields) => {
+            if fields.is_empty() {
+                out.push(tree_text(format!("{pad}{{ }} (empty)"), true));
+            } else {
+                for (k, v) in fields.iter() {
+                    match v {
+                        NestedNode::Leaf(s) => {
+                            out.push(tree_text(format!("{pad}{k}: {s}"), false));
+                        }
+                        NestedNode::Null => {
+                            out.push(tree_text(format!("{pad}{k}: ∅"), false));
+                        }
+                        _ => {
+                            out.push(tree_text(format!("{pad}{k}:"), true));
+                            out.extend(render_node(v, indent + 1));
+                        }
+                    }
+                }
+            }
+        }
+        NestedNode::Map(entries) => {
+            if entries.is_empty() {
+                out.push(tree_text(format!("{pad}{{ }} (empty map)"), true));
+            } else {
+                for (k, v) in entries.iter() {
+                    let k_label = match k {
+                        NestedNode::Leaf(s) => s.clone(),
+                        NestedNode::Null => "∅".to_string(),
+                        _ => "<key>".to_string(),
+                    };
+                    match v {
+                        NestedNode::Leaf(s) => {
+                            out.push(tree_text(format!("{pad}{k_label} → {s}"), false));
+                        }
+                        NestedNode::Null => {
+                            out.push(tree_text(format!("{pad}{k_label} → ∅"), false));
+                        }
+                        _ => {
+                            out.push(tree_text(format!("{pad}{k_label} →"), true));
+                            out.extend(render_node(v, indent + 1));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn tree_text<'a>(s: String, is_key: bool) -> Element<'a, Message> {
+    let mut t = text(s).size(12).wrapping(Wrapping::None);
+    if is_key {
+        t = t.style(|theme: &Theme| text::Style {
+            color: Some(theme.extended_palette().primary.strong.color),
+        });
+    }
+    t.into()
+}
+
+fn detail_panel_style(_theme: &Theme) -> ContainerStyle {
+    use crate::theme::palette;
+    ContainerStyle {
+        background: Some(Background::Color(palette::BG_SURFACE_2)),
+        text_color: Some(palette::FG_PRIMARY),
+        border: Border {
+            color: palette::BORDER_STRONG,
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+        ..ContainerStyle::default()
+    }
 }
 
 fn sidebar_toggle_button<'a>(collapsed: bool) -> Element<'a, Message> {
@@ -263,6 +428,7 @@ fn toolbar<'a>(_state: &'a WrangleState) -> Element<'a, Message> {
             "Values",
             &[
                 (EditorKind::FillNa, "Fill nulls"),
+                (EditorKind::NullIf, "Nullify =val"),
                 (EditorKind::FindReplace, "Find/Replace"),
             ],
         ),
@@ -334,10 +500,9 @@ fn category_label<'a>(label: &str) -> Element<'a, Message> {
     .into()
 }
 
-fn category_label_text_style(theme: &Theme) -> text::Style {
-    let p = theme.extended_palette();
+fn category_label_text_style(_theme: &Theme) -> text::Style {
     text::Style {
-        color: Some(p.background.base.text),
+        color: Some(crate::theme::palette::FG_MUTED),
     }
 }
 
@@ -462,6 +627,22 @@ fn editor_form<'a>(editor: &'a Editor) -> Element<'a, Message> {
                 labelled(
                     "Value (SQL literal)",
                     text_field(value, EditorField::Value, "0   or   'unknown'", 240.0),
+                ),
+            ]
+            .spacing(12)
+            .into(),
+        ),
+        Editor::NullIf { column, value } => (
+            "Nullify when equal",
+            "Replace matching values in a column with NULL (NULLIF).",
+            row![
+                labelled(
+                    "Column",
+                    text_field(column, EditorField::Column, "col_name", 200.0)
+                ),
+                labelled(
+                    "Match value (SQL literal)",
+                    text_field(value, EditorField::Value, "-1   or   ''", 240.0),
                 ),
             ]
             .spacing(12)
@@ -821,15 +1002,24 @@ fn view_grid<'a>(
         header = header.push(clickable_column_header(
             f.name(),
             CELL_WIDTH,
-            &format!("{}", f.data_type()),
+            f.data_type(),
+            &crate::format::type_label_full(f.data_type()),
             idx,
             selected,
         ));
     }
-    let header: Element<'a, Message> = container(header)
+    let total_width = ROW_NUMBER_WIDTH + CELL_WIDTH * schema.fields().len() as f32;
+    let header_inner = container(header)
         .height(Length::Fixed(HEADER_HEIGHT))
-        .style(header_row_style)
-        .into();
+        .style(header_row_style);
+    let header_rule = container(Space::new())
+        .width(Length::Fixed(total_width))
+        .height(Length::Fixed(1.0))
+        .style(|_: &Theme| ContainerStyle {
+            background: Some(Background::Color(crate::theme::palette::BORDER_STRONG)),
+            ..ContainerStyle::default()
+        });
+    let header: Element<'a, Message> = column![header_inner, header_rule].into();
 
     let before_rows: Option<Vec<Vec<String>>> = diff_before.map(|b| {
         (0..b.num_rows())
@@ -859,12 +1049,34 @@ fn view_grid<'a>(
                 .and_then(|b| b.get(c))
                 .map(|prev| prev != &v)
                 .unwrap_or(false);
-            row_widgets = row_widgets.push(body_cell(v, CELL_WIDTH, zebra, changed));
+            let dt = schema.field(c).data_type();
+            let is_nested_cell = is_nested(dt);
+            let kind = crate::wrangle::insights::classify(dt);
+            let right_align = matches!(kind, crate::wrangle::insights::ColumnKind::Numeric);
+            row_widgets = row_widgets.push(body_cell(
+                v,
+                CELL_WIDTH,
+                zebra,
+                changed,
+                is_nested_cell,
+                right_align,
+                r,
+                c,
+            ));
         }
         let styled = container(row_widgets)
             .height(Length::Fixed(ROW_HEIGHT))
             .style(move |theme: &Theme| body_row_style(theme, zebra));
         rows_col = rows_col.push(styled);
+        rows_col = rows_col.push(
+            container(Space::new())
+                .width(Length::Fixed(total_width))
+                .height(Length::Fixed(1.0))
+                .style(|_: &Theme| ContainerStyle {
+                    background: Some(Background::Color(crate::theme::palette::BORDER_SUBTLE)),
+                    ..ContainerStyle::default()
+                }),
+        );
     }
 
     rows_col.into()
@@ -1090,10 +1302,10 @@ fn view_footer<'a>(
 }
 
 fn header_cell<'a>(label: &str, width: f32) -> Element<'a, Message> {
-    container(text(label.to_string()).size(13).wrapping(Wrapping::None))
+    container(crate::theme::label_text(label).wrapping(Wrapping::None))
         .width(Length::Fixed(width))
         .height(Length::Fill)
-        .padding([6, 10])
+        .padding([8, 12])
         .clip(true)
         .style(header_cell_style)
         .into()
@@ -1102,14 +1314,37 @@ fn header_cell<'a>(label: &str, width: f32) -> Element<'a, Message> {
 fn clickable_column_header<'a>(
     label: &str,
     width: f32,
+    dt: &arrow::datatypes::DataType,
     tt: &str,
     idx: usize,
     selected: bool,
 ) -> Element<'a, Message> {
-    let cell = container(text(label.to_string()).size(13).wrapping(Wrapping::None))
+    let name = crate::theme::ui_medium(label.to_string())
+        .size(12)
+        .wrapping(Wrapping::None);
+
+    let kind = crate::wrangle::insights::classify(dt);
+    let colors = if crate::format::is_nested(dt) {
+        crate::theme::pill_colors_nested()
+    } else {
+        crate::theme::pill_colors_for(kind)
+    };
+    let type_str = crate::format::type_label(dt);
+    let pill = container(
+        text(type_str)
+            .font(crate::theme::FONT_MONO)
+            .size(9)
+            .wrapping(Wrapping::None),
+    )
+    .padding([1, 6])
+    .style(crate::theme::pill_style(colors));
+
+    let inner = column![name, pill].spacing(3);
+
+    let cell = container(inner)
         .width(Length::Fixed(width))
         .height(Length::Fill)
-        .padding([6, 10])
+        .padding([6, 12])
         .clip(true)
         .style(move |theme: &Theme| selectable_header_style(theme, selected));
 
@@ -1227,28 +1462,37 @@ fn summary_body<'a>(s: &'a ColumnSummary) -> Element<'a, Message> {
     col.into()
 }
 
-fn selectable_header_style(theme: &Theme, selected: bool) -> ContainerStyle {
-    let p = theme.extended_palette();
+fn selectable_header_style(_theme: &Theme, selected: bool) -> ContainerStyle {
+    use crate::theme::palette;
     let bg = if selected {
-        Some(Background::Color(p.primary.weak.color))
+        Some(Background::Color(palette::ACCENT_WARM_SOFT))
     } else {
         None
     };
+    let border_color = if selected {
+        palette::ACCENT_WARM
+    } else {
+        palette::BORDER_SUBTLE
+    };
     ContainerStyle {
         background: bg,
-        text_color: Some(p.background.strong.text),
-        border: Border::default(),
+        text_color: Some(palette::FG_PRIMARY),
+        border: Border {
+            color: border_color,
+            width: 0.0,
+            radius: 0.0.into(),
+        },
         ..ContainerStyle::default()
     }
 }
 
-fn summary_panel_style(theme: &Theme) -> ContainerStyle {
-    let p = theme.extended_palette();
+fn summary_panel_style(_theme: &Theme) -> ContainerStyle {
+    use crate::theme::palette;
     ContainerStyle {
-        background: Some(Background::Color(p.background.weak.color)),
-        text_color: Some(p.background.weak.text),
+        background: Some(Background::Color(palette::BG_SURFACE)),
+        text_color: Some(palette::FG_PRIMARY),
         border: Border {
-            color: p.background.strong.color,
+            color: palette::BORDER_SUBTLE,
             width: 1.0,
             radius: 4.0.into(),
         },
@@ -1256,50 +1500,108 @@ fn summary_panel_style(theme: &Theme) -> ContainerStyle {
     }
 }
 
-fn body_cell<'a>(value: String, width: f32, zebra: bool, changed: bool) -> Element<'a, Message> {
-    let label = text(value.clone()).size(13).wrapping(Wrapping::None);
+#[allow(clippy::too_many_arguments)]
+fn body_cell<'a>(
+    value: String,
+    width: f32,
+    zebra: bool,
+    changed: bool,
+    is_nested: bool,
+    right_align: bool,
+    row: usize,
+    col: usize,
+) -> Element<'a, Message> {
+    let display = if is_nested {
+        format!("⊞ {value}")
+    } else {
+        value.clone()
+    };
+    let is_null = value == "∅";
+    let mut label = text(display)
+        .font(crate::theme::FONT_MONO)
+        .size(12)
+        .wrapping(Wrapping::None);
+    if right_align {
+        label = label
+            .align_x(iced::alignment::Horizontal::Right)
+            .width(Length::Fill);
+    }
+    if is_nested {
+        label = label.style(|_: &Theme| text::Style {
+            color: Some(crate::theme::palette::ACCENT_WARM),
+        });
+    } else if is_null {
+        label = label.style(|_: &Theme| text::Style {
+            color: Some(crate::theme::palette::FG_DIM),
+        });
+    }
     let inner = container(label)
         .width(Length::Fixed(width))
         .height(Length::Fill)
-        .padding([4, 10])
+        .padding([4, 12])
         .clip(true)
         .style(move |theme: &Theme| body_cell_style(theme, zebra, changed));
 
-    let with_tooltip: Element<'a, Message> = if value.chars().count() > OVERFLOW_CHAR_THRESHOLD {
-        tooltip(inner, tooltip_box(value.clone()), tooltip::Position::Top).into()
+    let with_tooltip: Element<'a, Message> =
+        if !is_nested && value.chars().count() > OVERFLOW_CHAR_THRESHOLD {
+            tooltip(inner, tooltip_box(value.clone()), tooltip::Position::Top).into()
+        } else if is_nested {
+            tooltip(
+                inner,
+                tooltip_box("Click to expand".to_string()),
+                tooltip::Position::Top,
+            )
+            .into()
+        } else {
+            inner.into()
+        };
+
+    let on_press = if is_nested {
+        Message::ShowCellDetail { row, col }
     } else {
-        inner.into()
+        Message::CopyCell(value)
     };
 
-    mouse_area(with_tooltip)
-        .on_press(Message::CopyCell(value))
-        .into()
+    mouse_area(with_tooltip).on_press(on_press).into()
 }
 
 fn row_number_cell<'a>(n: usize, zebra: bool) -> Element<'a, Message> {
-    container(text(format!("{}", n)).size(12).wrapping(Wrapping::None))
-        .width(Length::Fixed(ROW_NUMBER_WIDTH))
-        .height(Length::Fill)
-        .padding([4, 10])
-        .clip(true)
-        .style(move |theme: &Theme| row_number_style(theme, zebra))
-        .into()
+    container(
+        text(format!("{}", n))
+            .font(crate::theme::FONT_MONO)
+            .size(11)
+            .wrapping(Wrapping::None)
+            .align_x(iced::alignment::Horizontal::Right)
+            .width(Length::Fill)
+            .style(|_: &Theme| text::Style {
+                color: Some(crate::theme::palette::FG_DIM),
+            }),
+    )
+    .width(Length::Fixed(ROW_NUMBER_WIDTH))
+    .height(Length::Fill)
+    .padding([4, 10])
+    .clip(true)
+    .style(move |theme: &Theme| row_number_style(theme, zebra))
+    .into()
 }
 
 fn tooltip_box<'a>(content: String) -> Element<'a, Message> {
+    use crate::theme::palette;
     container(
         text(content)
-            .size(12)
-            .style(move |theme: &Theme| text::Style {
-                color: Some(theme.extended_palette().background.strong.text),
+            .font(crate::theme::FONT_MONO)
+            .size(11)
+            .style(|_: &Theme| text::Style {
+                color: Some(palette::FG_PRIMARY),
             }),
     )
-    .padding([4, 8])
-    .max_width(520.0)
-    .style(move |theme: &Theme| ContainerStyle {
-        background: Some(theme.extended_palette().background.strong.color.into()),
+    .padding([6, 10])
+    .max_width(560.0)
+    .style(|_: &Theme| ContainerStyle {
+        background: Some(Background::Color(palette::BG_SURFACE_2)),
+        text_color: Some(palette::FG_PRIMARY),
         border: Border {
-            color: theme.extended_palette().background.strong.color,
+            color: palette::BORDER_STRONG,
             width: 1.0,
             radius: 4.0.into(),
         },
@@ -1308,13 +1610,13 @@ fn tooltip_box<'a>(content: String) -> Element<'a, Message> {
     .into()
 }
 
-fn sidebar_panel_style(theme: &Theme) -> ContainerStyle {
-    let p = theme.extended_palette();
+fn sidebar_panel_style(_theme: &Theme) -> ContainerStyle {
+    use crate::theme::palette;
     ContainerStyle {
-        background: Some(Background::Color(p.background.base.color)),
-        text_color: Some(p.background.base.text),
+        background: Some(Background::Color(palette::BG_SURFACE)),
+        text_color: Some(palette::FG_PRIMARY),
         border: Border {
-            color: p.background.strong.color,
+            color: palette::BORDER_SUBTLE,
             width: 1.0,
             radius: 0.0.into(),
         },
@@ -1322,69 +1624,13 @@ fn sidebar_panel_style(theme: &Theme) -> ContainerStyle {
     }
 }
 
-fn toolbar_style(theme: &Theme) -> ContainerStyle {
-    let p = theme.extended_palette();
+fn toolbar_style(_theme: &Theme) -> ContainerStyle {
+    use crate::theme::palette;
     ContainerStyle {
-        background: Some(Background::Color(p.background.weak.color)),
-        text_color: Some(p.background.weak.text),
+        background: Some(Background::Color(palette::BG_SURFACE_2)),
+        text_color: Some(palette::FG_PRIMARY),
         border: Border {
-            color: p.background.strong.color,
-            width: 1.0,
-            radius: 6.0.into(),
-        },
-        ..ContainerStyle::default()
-    }
-}
-
-fn step_badge_style(theme: &Theme) -> ContainerStyle {
-    let p = theme.extended_palette();
-    ContainerStyle {
-        background: Some(Background::Color(p.primary.base.color)),
-        text_color: Some(p.primary.base.text),
-        border: Border {
-            color: p.primary.base.color,
-            width: 0.0,
-            radius: 10.0.into(),
-        },
-        ..ContainerStyle::default()
-    }
-}
-
-fn empty_state_style(theme: &Theme) -> ContainerStyle {
-    let p = theme.extended_palette();
-    ContainerStyle {
-        background: Some(Background::Color(p.background.weak.color)),
-        text_color: Some(p.background.weak.text),
-        border: Border {
-            color: p.background.strong.color,
-            width: 1.0,
-            radius: 6.0.into(),
-        },
-        ..ContainerStyle::default()
-    }
-}
-
-fn sql_body_style(theme: &Theme) -> ContainerStyle {
-    let p = theme.extended_palette();
-    ContainerStyle {
-        background: Some(Background::Color(p.background.base.color)),
-        text_color: Some(p.background.base.text),
-        border: Border {
-            color: p.background.strong.color,
-            width: 1.0,
-            radius: 3.0.into(),
-        },
-        ..ContainerStyle::default()
-    }
-}
-
-fn editor_panel_style(theme: &Theme) -> ContainerStyle {
-    let p = theme.extended_palette();
-    ContainerStyle {
-        background: Some(Background::Color(p.background.weak.color)),
-        text_color: Some(p.background.weak.text),
-        border: Border {
-            color: p.primary.base.color,
+            color: palette::BORDER_SUBTLE,
             width: 1.0,
             radius: 4.0.into(),
         },
@@ -1392,21 +1638,77 @@ fn editor_panel_style(theme: &Theme) -> ContainerStyle {
     }
 }
 
-fn step_row_style_selected(theme: &Theme, selected: bool) -> ContainerStyle {
-    let p = theme.extended_palette();
+fn step_badge_style(_theme: &Theme) -> ContainerStyle {
+    use crate::theme::palette;
+    ContainerStyle {
+        background: Some(Background::Color(palette::ACCENT_WARM)),
+        text_color: Some(palette::BG_DEEP),
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: 10.0.into(),
+        },
+        ..ContainerStyle::default()
+    }
+}
+
+fn empty_state_style(_theme: &Theme) -> ContainerStyle {
+    use crate::theme::palette;
+    ContainerStyle {
+        background: Some(Background::Color(palette::BG_SURFACE)),
+        text_color: Some(palette::FG_MUTED),
+        border: Border {
+            color: palette::BORDER_SUBTLE,
+            width: 1.0,
+            radius: 4.0.into(),
+        },
+        ..ContainerStyle::default()
+    }
+}
+
+fn sql_body_style(_theme: &Theme) -> ContainerStyle {
+    use crate::theme::palette;
+    ContainerStyle {
+        background: Some(Background::Color(palette::BG_DEEP)),
+        text_color: Some(palette::FG_PRIMARY),
+        border: Border {
+            color: palette::BORDER_SUBTLE,
+            width: 1.0,
+            radius: 3.0.into(),
+        },
+        ..ContainerStyle::default()
+    }
+}
+
+fn editor_panel_style(_theme: &Theme) -> ContainerStyle {
+    use crate::theme::palette;
+    ContainerStyle {
+        background: Some(Background::Color(palette::BG_SURFACE_2)),
+        text_color: Some(palette::FG_PRIMARY),
+        border: Border {
+            color: palette::ACCENT_WARM,
+            width: 1.0,
+            radius: 4.0.into(),
+        },
+        ..ContainerStyle::default()
+    }
+}
+
+fn step_row_style_selected(_theme: &Theme, selected: bool) -> ContainerStyle {
+    use crate::theme::palette;
     let bg = if selected {
-        p.primary.weak.color
+        palette::ACCENT_WARM_SOFT
     } else {
-        p.background.weak.color
+        palette::BG_SURFACE_2
     };
     ContainerStyle {
         background: Some(Background::Color(bg)),
-        text_color: Some(p.background.weak.text),
+        text_color: Some(palette::FG_PRIMARY),
         border: Border {
             color: if selected {
-                p.primary.base.color
+                palette::ACCENT_WARM
             } else {
-                p.background.strong.color
+                palette::BORDER_SUBTLE
             },
             width: 1.0,
             radius: 3.0.into(),
@@ -1415,91 +1717,105 @@ fn step_row_style_selected(theme: &Theme, selected: bool) -> ContainerStyle {
     }
 }
 
-fn insights_row_style(theme: &Theme) -> ContainerStyle {
-    let p = theme.extended_palette();
+fn insights_row_style(_theme: &Theme) -> ContainerStyle {
+    use crate::theme::palette;
     ContainerStyle {
-        background: Some(Background::Color(p.background.weak.color)),
-        text_color: Some(p.background.weak.text),
+        background: Some(Background::Color(palette::BG_SURFACE)),
+        text_color: Some(palette::FG_MUTED),
+        border: Border {
+            color: palette::BORDER_SUBTLE,
+            width: 0.0,
+            radius: 0.0.into(),
+        },
+        ..ContainerStyle::default()
+    }
+}
+
+fn bar_bg_style(_theme: &Theme) -> ContainerStyle {
+    use crate::theme::palette;
+    ContainerStyle {
+        background: Some(Background::Color(palette::BG_SURFACE_2)),
         border: Border::default(),
         ..ContainerStyle::default()
     }
 }
 
-fn bar_bg_style(theme: &Theme) -> ContainerStyle {
-    let p = theme.extended_palette();
+fn bar_fill_style(_theme: &Theme) -> ContainerStyle {
+    use crate::theme::palette;
     ContainerStyle {
-        background: Some(Background::Color(p.background.base.color)),
+        background: Some(Background::Color(Color {
+            a: 0.75,
+            ..palette::ACCENT_WARM
+        })),
         border: Border::default(),
         ..ContainerStyle::default()
     }
 }
 
-fn bar_fill_style(theme: &Theme) -> ContainerStyle {
-    let p = theme.extended_palette();
+fn header_row_style(_theme: &Theme) -> ContainerStyle {
+    use crate::theme::palette;
     ContainerStyle {
-        background: Some(Background::Color(p.primary.base.color)),
-        border: Border::default(),
+        background: Some(Background::Color(palette::BG_SURFACE)),
+        text_color: Some(palette::FG_MUTED),
+        border: Border {
+            color: palette::BORDER_SUBTLE,
+            width: 0.0,
+            radius: 0.0.into(),
+        },
         ..ContainerStyle::default()
     }
 }
 
-fn header_row_style(theme: &Theme) -> ContainerStyle {
-    let p = theme.extended_palette();
-    ContainerStyle {
-        background: Some(Background::Color(p.background.strong.color)),
-        text_color: Some(p.background.strong.text),
-        border: Border::default(),
-        ..ContainerStyle::default()
-    }
-}
-
-fn header_cell_style(theme: &Theme) -> ContainerStyle {
-    let p = theme.extended_palette();
+fn header_cell_style(_theme: &Theme) -> ContainerStyle {
+    use crate::theme::palette;
     ContainerStyle {
         background: None,
-        text_color: Some(p.background.strong.text),
+        text_color: Some(palette::FG_MUTED),
         border: Border::default(),
         ..ContainerStyle::default()
     }
 }
 
-fn body_row_style(theme: &Theme, zebra: bool) -> ContainerStyle {
-    let p = theme.extended_palette();
-    let bg = if zebra {
-        p.background.weak.color
-    } else {
-        p.background.base.color
-    };
+fn body_row_style(_theme: &Theme, _zebra: bool) -> ContainerStyle {
+    use crate::theme::palette;
     ContainerStyle {
-        background: Some(Background::Color(bg)),
-        text_color: Some(p.background.base.text),
-        border: Border::default(),
+        background: Some(Background::Color(palette::BG_DEEP)),
+        text_color: Some(palette::FG_PRIMARY),
+        border: Border {
+            color: palette::BORDER_SUBTLE,
+            width: 0.0,
+            radius: 0.0.into(),
+        },
         ..ContainerStyle::default()
     }
 }
 
-fn body_cell_style(theme: &Theme, _zebra: bool, changed: bool) -> ContainerStyle {
-    let p = theme.extended_palette();
+fn body_cell_style(_theme: &Theme, _zebra: bool, changed: bool) -> ContainerStyle {
+    use crate::theme::palette;
     let bg = if changed {
-        Some(Background::Color(Color::from_rgba(0.95, 0.85, 0.2, 0.45)))
+        Some(Background::Color(palette::DIFF_CHANGED_BG))
     } else {
         None
     };
     ContainerStyle {
         background: bg,
-        text_color: Some(p.background.base.text),
-        border: Border::default(),
+        text_color: Some(palette::FG_PRIMARY),
+        border: Border {
+            color: palette::BORDER_SUBTLE,
+            width: 0.0,
+            radius: 0.0.into(),
+        },
         ..ContainerStyle::default()
     }
 }
 
-fn diff_banner_style(theme: &Theme) -> ContainerStyle {
-    let p = theme.extended_palette();
+fn diff_banner_style(_theme: &Theme) -> ContainerStyle {
+    use crate::theme::palette;
     ContainerStyle {
-        background: Some(Background::Color(p.primary.weak.color)),
-        text_color: Some(p.primary.weak.text),
+        background: Some(Background::Color(palette::ACCENT_WARM_SOFT)),
+        text_color: Some(palette::ACCENT_WARM),
         border: Border {
-            color: p.primary.base.color,
+            color: palette::ACCENT_WARM,
             width: 1.0,
             radius: 4.0.into(),
         },
@@ -1507,17 +1823,16 @@ fn diff_banner_style(theme: &Theme) -> ContainerStyle {
     }
 }
 
-fn row_number_style(theme: &Theme, zebra: bool) -> ContainerStyle {
-    let p = theme.extended_palette();
-    let bg = if zebra {
-        p.background.weak.color
-    } else {
-        p.background.base.color
-    };
+fn row_number_style(_theme: &Theme, _zebra: bool) -> ContainerStyle {
+    use crate::theme::palette;
     ContainerStyle {
-        background: Some(Background::Color(bg)),
-        text_color: Some(p.background.weak.text),
-        border: Border::default(),
+        background: Some(Background::Color(palette::BG_DEEP)),
+        text_color: Some(palette::FG_DIM),
+        border: Border {
+            color: palette::BORDER_SUBTLE,
+            width: 0.0,
+            radius: 0.0.into(),
+        },
         ..ContainerStyle::default()
     }
 }

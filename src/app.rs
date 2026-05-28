@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use ahash::AHashSet;
 use arrow::record_batch::RecordBatch;
 use iced::widget::{Space, button, column, container, row, scrollable, text};
 use iced::{Element, Length, Task};
@@ -63,6 +64,19 @@ pub struct WrangleState {
 
     pub sql_collapsed: bool,
     pub sidebar_collapsed: bool,
+
+    pub cell_detail: Option<CellDetail>,
+    pub expanded_schema_rows: AHashSet<usize>,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct CellDetail {
+    pub row: usize,
+    pub col: usize,
+    pub column_name: String,
+    pub type_label: String,
+    pub node: crate::format::NestedNode,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -89,6 +103,10 @@ pub enum Editor {
         target_type: String,
     },
     FillNa {
+        column: String,
+        value: String,
+    },
+    NullIf {
         column: String,
         value: String,
     },
@@ -147,6 +165,7 @@ pub enum EditorKind {
     Rename,
     Cast,
     FillNa,
+    NullIf,
     DropNa,
     FindReplace,
     Lowercase,
@@ -209,6 +228,10 @@ impl Editor {
                 column: String::new(),
                 value: String::new(),
             },
+            EditorKind::NullIf => Editor::NullIf {
+                column: String::new(),
+                value: String::new(),
+            },
             EditorKind::DropNa => Editor::DropNa {
                 columns: String::new(),
             },
@@ -268,6 +291,8 @@ impl Editor {
             (Editor::Cast { target_type, .. }, EditorField::TargetType) => *target_type = value,
             (Editor::FillNa { column, .. }, EditorField::Column) => *column = value,
             (Editor::FillNa { value: v, .. }, EditorField::Value) => *v = value,
+            (Editor::NullIf { column, .. }, EditorField::Column) => *column = value,
+            (Editor::NullIf { value: v, .. }, EditorField::Value) => *v = value,
             (Editor::DropNa { columns }, EditorField::Columns) => *columns = value,
             (Editor::FindReplace { column, .. }, EditorField::Column) => *column = value,
             (Editor::FindReplace { pattern, .. }, EditorField::Pattern) => *pattern = value,
@@ -337,6 +362,8 @@ impl Editor {
             }),
             Editor::FillNa { column, value } => (valid_required(&column) && valid_required(&value))
                 .then_some(Step::FillNa { column, value }),
+            Editor::NullIf { column, value } => (valid_required(&column) && valid_required(&value))
+                .then_some(Step::NullIf { column, value }),
             Editor::DropNa { columns } => Some(Step::DropNa {
                 columns: split_csv(&columns),
             }),
@@ -472,6 +499,9 @@ pub enum Message {
     WranglePageSizeCommit,
     CopyCell(String),
     ClearCopyNotice,
+    ShowCellDetail { row: usize, col: usize },
+    CloseCellDetail,
+    ToggleSchemaRow(usize),
 }
 
 impl App {
@@ -659,6 +689,7 @@ impl App {
             Message::WranglePageLoaded(Ok(batch)) => {
                 self.wrangle.batch_loading = false;
                 self.wrangle.batch = Some(batch);
+                self.wrangle.cell_detail = None;
                 Task::none()
             }
             Message::WranglePageLoaded(Err(e)) => {
@@ -857,6 +888,36 @@ impl App {
                 self.copy_notice = None;
                 Task::none()
             }
+            Message::ShowCellDetail { row, col } => {
+                if let Some(batch) = self.wrangle.batch.as_ref()
+                    && col < batch.num_columns()
+                    && row < batch.num_rows()
+                {
+                    let opts = crate::format::default_options();
+                    let array = batch.column(col);
+                    let node = crate::format::cell_node(array.as_ref(), row, &opts);
+                    let schema = batch.schema();
+                    let field = schema.field(col);
+                    self.wrangle.cell_detail = Some(CellDetail {
+                        row,
+                        col,
+                        column_name: field.name().clone(),
+                        type_label: crate::format::type_label(field.data_type()),
+                        node,
+                    });
+                }
+                Task::none()
+            }
+            Message::CloseCellDetail => {
+                self.wrangle.cell_detail = None;
+                Task::none()
+            }
+            Message::ToggleSchemaRow(i) => {
+                if !self.wrangle.expanded_schema_rows.remove(&i) {
+                    self.wrangle.expanded_schema_rows.insert(i);
+                }
+                Task::none()
+            }
         }
     }
 
@@ -957,58 +1018,152 @@ impl App {
     }
 
     fn view_header(&self) -> Element<'_, Message> {
-        let mut open = button(text("Open Parquet…")).on_press(Message::OpenFilePressed);
+        use crate::format::human_bytes;
+        use crate::theme;
+
+        let mut open_btn = button(theme::ui_medium("Open Parquet…").size(12))
+            .style(theme::ghost_button)
+            .padding([6, 12]);
         if self.loading {
-            open = button(text("Loading…"));
+            open_btn = button(theme::ui_medium("Loading…").size(12))
+                .style(theme::ghost_button)
+                .padding([6, 12]);
+        } else {
+            open_btn = open_btn.on_press(Message::OpenFilePressed);
         }
 
-        let path_label: Element<'_, Message> = match &self.file {
-            Some(f) => text(f.path.display().to_string()).into(),
-            None => text("No file loaded").into(),
+        let (title_line, sub_line): (Element<'_, Message>, Element<'_, Message>) = match &self.file
+        {
+            Some(f) => {
+                let filename = f
+                    .path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("(unknown)")
+                    .to_string();
+                let size = human_bytes(f.file_size_bytes);
+                let cols = f.schema.fields().len();
+                let rows_str = if f.total_rows >= 0 {
+                    format_thousands(f.total_rows as u64)
+                } else {
+                    "?".into()
+                };
+                let title = row![
+                    theme::label_text("PARQUET"),
+                    Space::new().width(Length::Fixed(10.0)),
+                    theme::display_strong(filename),
+                    Space::new().width(Length::Fill),
+                    theme::mono_sm(size).style(|_: &iced::Theme| iced::widget::text::Style {
+                        color: Some(theme::palette::FG_MUTED),
+                    }),
+                ]
+                .align_y(iced::Alignment::Center)
+                .spacing(0);
+
+                let sub = row![
+                    theme::mono_sm(f.path.display().to_string()).style(|_: &iced::Theme| {
+                        iced::widget::text::Style {
+                            color: Some(theme::palette::FG_MUTED),
+                        }
+                    }),
+                    Space::new().width(Length::Fill),
+                    theme::mono_sm(format!("{rows_str} rows · {cols} cols")).style(
+                        |_: &iced::Theme| iced::widget::text::Style {
+                            color: Some(theme::palette::FG_MUTED),
+                        }
+                    ),
+                ]
+                .align_y(iced::Alignment::Center)
+                .spacing(8);
+
+                (title.into(), sub.into())
+            }
+            None => {
+                let title = row![
+                    theme::label_text("PARQUET"),
+                    Space::new().width(Length::Fixed(10.0)),
+                    theme::display_strong("No file loaded"),
+                ]
+                .align_y(iced::Alignment::Center)
+                .spacing(0);
+                let sub = theme::mono_sm("Click \"Open Parquet…\" to begin")
+                    .style(|_: &iced::Theme| iced::widget::text::Style {
+                        color: Some(theme::palette::FG_MUTED),
+                    })
+                    .into();
+                (title.into(), sub)
+            }
         };
 
         let notice: Element<'_, Message> = match &self.copy_notice {
-            Some(msg) => container(text(msg.clone()).size(14))
-                .padding([4, 10])
-                .style(container::rounded_box)
+            Some(msg) => container(theme::mono_sm(msg.clone()))
+                .padding([3, 10])
+                .style(theme::notice_pill)
                 .into(),
             None => Space::new().width(Length::Fixed(0.0)).into(),
         };
 
-        container(
-            row![
-                open,
-                Space::new().width(Length::Fixed(12.0)),
-                path_label,
-                Space::new().width(Length::Fill),
-                notice,
-            ]
+        let line1 = row![
+            title_line,
+            Space::new().width(Length::Fixed(14.0)),
+            notice,
+            Space::new().width(Length::Fixed(14.0)),
+            open_btn,
+        ]
+        .align_y(iced::Alignment::Center)
+        .spacing(0);
+
+        let inner = column![line1, sub_line].spacing(4);
+
+        container(container(inner).padding([12, 18]))
             .width(Length::Fill)
-            .align_y(iced::Alignment::Center)
-            .spacing(8),
-        )
-        .padding(10)
-        .width(Length::Fill)
-        .into()
+            .style(theme::top_bar)
+            .into()
     }
 
     fn view_tabs(&self) -> Element<'_, Message> {
-        let mut r = row![].spacing(4);
+        use crate::theme;
+        let mut r = row![].spacing(0);
         let enabled = self.file.is_some();
         for tab in Tab::ALL {
-            let label = text(tab.label());
-            let mut btn = button(label);
+            let active = tab == self.tab;
+            let label = theme::label_text(tab.label()).style(move |_: &iced::Theme| {
+                iced::widget::text::Style {
+                    color: Some(if active {
+                        theme::palette::FG_PRIMARY
+                    } else {
+                        theme::palette::FG_MUTED
+                    }),
+                }
+            });
+            let mut btn = button(label)
+                .padding([10, 16])
+                .style(theme::tab_button(active));
             if enabled || tab == Tab::Overview {
                 btn = btn.on_press(Message::TabSelected(tab));
             }
-            if tab == self.tab {
-                btn = btn.style(button::primary);
-            } else {
-                btn = btn.style(button::secondary);
-            }
-            r = r.push(btn);
+            let underline_height = if active { 2.0 } else { 0.0 };
+            let underline = container(Space::new())
+                .height(Length::Fixed(underline_height))
+                .width(Length::Fill)
+                .style(theme::tab_underline);
+            let tab_cell = column![btn, underline].width(Length::Shrink);
+            r = r.push(tab_cell);
+            // Original-style fallthrough: also keep this entry in the loop logic.
+            // (No-op placeholder for the now-removed if/else further down.)
+            let _ = (active,);
         }
-        container(r).padding([4, 10]).into()
+        let r_with_rule = column![
+            container(r).padding([0, 18]),
+            container(Space::new())
+                .height(Length::Fixed(1.0))
+                .width(Length::Fill)
+                .style(theme::top_bar_divider),
+        ];
+        container(r_with_rule)
+            .width(Length::Fill)
+            .style(theme::top_bar)
+            .into()
     }
 
     fn view_body(&self) -> Element<'_, Message> {
@@ -1031,7 +1186,7 @@ impl App {
         }
 
         let content: Element<'_, Message> = match self.tab {
-            Tab::Overview => views::overview::view(file),
+            Tab::Overview => views::overview::view(file, &self.wrangle.expanded_schema_rows),
             Tab::RowGroups => views::row_groups::view(file, self.selected_row_group),
             Tab::Data => unreachable!("handled above"),
         };
@@ -1045,4 +1200,17 @@ impl App {
             .height(Length::Fill)
             .into()
     }
+}
+
+fn format_thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    let len = digits.len();
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (len - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
 }

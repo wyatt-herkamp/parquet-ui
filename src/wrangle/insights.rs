@@ -70,10 +70,100 @@ pub async fn compute_all(session: Arc<WrangleSession>) -> Result<Vec<ColumnInsig
     let mut out = Vec::with_capacity(schema.fields().len());
     for field in schema.fields() {
         let kind = classify(field.data_type());
-        let insight = compute_one(session.clone(), field.name(), kind).await?;
+        let dt = field.data_type();
+        let insight = if is_unaggregatable(dt) {
+            match compute_nullcount_only(session.clone(), field.name(), kind).await {
+                Ok(i) => i,
+                Err(e) => {
+                    tracing::debug!(column = field.name(), error = %e, "insight fallback failed");
+                    ColumnInsight {
+                        name: field.name().to_string(),
+                        kind,
+                        total: 0,
+                        null_count: 0,
+                        distinct: None,
+                        min: None,
+                        max: None,
+                        histogram: None,
+                        top_values: None,
+                    }
+                }
+            }
+        } else {
+            match compute_one(session.clone(), field.name(), kind).await {
+                Ok(i) => i,
+                Err(e) => {
+                    tracing::warn!(column = field.name(), error = %e, "insight failed; skipping");
+                    ColumnInsight {
+                        name: field.name().to_string(),
+                        kind,
+                        total: 0,
+                        null_count: 0,
+                        distinct: None,
+                        min: None,
+                        max: None,
+                        histogram: None,
+                        top_values: None,
+                    }
+                }
+            }
+        };
         out.push(insight);
     }
     Ok(out)
+}
+
+/// Nested / unsupported types can't be cast to VARCHAR for distinct/min/max,
+/// and DataFusion will error. We compute total + nulls only and skip the rest.
+fn is_unaggregatable(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::FixedSizeList(_, _)
+            | DataType::ListView(_)
+            | DataType::LargeListView(_)
+            | DataType::Struct(_)
+            | DataType::Map(_, _)
+            | DataType::Union(_, _)
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::BinaryView
+            | DataType::FixedSizeBinary(_)
+    )
+}
+
+async fn compute_nullcount_only(
+    session: Arc<WrangleSession>,
+    name: &str,
+    kind: ColumnKind,
+) -> Result<ColumnInsight, String> {
+    let id = ident(name);
+    let sql =
+        format!("SELECT COUNT(*) AS total, (COUNT(*) - COUNT({id})) AS nulls FROM {TABLE_NAME}");
+    let df = session
+        .ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| format!("insights null-only sql ({name}): {e}"))?;
+    let batches = df
+        .collect()
+        .await
+        .map_err(|e| format!("insights null-only collect ({name}): {e}"))?;
+    let b = batches.first().ok_or("empty insights result")?;
+    let total = scalar_u64(b.column(0))?;
+    let nulls = scalar_u64(b.column(1))?;
+    Ok(ColumnInsight {
+        name: name.to_string(),
+        kind,
+        total,
+        null_count: nulls,
+        distinct: None,
+        min: None,
+        max: None,
+        histogram: None,
+        top_values: None,
+    })
 }
 
 async fn compute_one(

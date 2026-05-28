@@ -1,6 +1,7 @@
 mod app;
 mod format;
 mod parquet_io;
+mod theme;
 mod views;
 mod wrangle;
 
@@ -19,7 +20,18 @@ fn main() -> iced::Result {
 
     tracing::info!("starting parquet-ui");
 
+    fn theme_for(_: &App) -> iced::Theme {
+        theme::instrument_theme()
+    }
+
     iced::application(App::boot, App::update, App::view)
         .title(App::title)
+        .theme(theme_for)
+        .font(theme::GEIST_REGULAR_BYTES)
+        .font(theme::GEIST_MEDIUM_BYTES)
+        .font(theme::GEIST_SEMIBOLD_BYTES)
+        .font(theme::JETBRAINS_MONO_REGULAR_BYTES)
+        .font(theme::JETBRAINS_MONO_MEDIUM_BYTES)
+        .default_font(theme::FONT_UI)
         .run()
 }
